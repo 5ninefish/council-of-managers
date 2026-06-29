@@ -1,14 +1,21 @@
 """
-council-of-managers — minimal orchestrator scaffold
+council-of-managers — orchestrator (v1.1 — live SDK wiring)
 
-This scaffold shows the structural wiring of the Council of Managers pattern.
-It is NOT a working LLM client — replace the stub functions with your actual
-provider SDK calls.
+Implements the Council of Managers pattern with real LLM calls:
+  Proposer: Anthropic Claude (claude-sonnet-4-6 by default)
+  Critic:   Google Gemini  (gemini-2.5-flash by default)
 
-Dependencies: Python 3.11+ stdlib only.
+Environment variables:
+  ANTHROPIC_API_KEY   required
+  GOOGLE_API_KEY      required
+  PROPOSER_MODEL      optional, default claude-sonnet-4-6
+  CRITIC_MODEL        optional, default gemini-2.5-flash
+
+Dependencies: see requirements.txt
 """
 
 import json
+import os
 import uuid
 import argparse
 from pathlib import Path
@@ -26,31 +33,78 @@ HISTORY_TURNS_LIMIT = 6
 
 
 # ---------------------------------------------------------------------------
-# Stub LLM calls — replace with your SDK (anthropic, openai, google-generativeai)
+# LLM calls — Anthropic (proposer + self-check) + Gemini (critic)
 # ---------------------------------------------------------------------------
 
 def call_proposer(system_prompt: str, user_question: str) -> dict:
-    """Replace with: anthropic.messages.create(...) or openai.chat.completions.create(...)"""
-    raise NotImplementedError(
-        "Replace call_proposer() with your LLM SDK. "
-        "Return: {'answer': str, 'ruling_implied': bool, 'supersedes': list[str], 'scope': str}"
+    """Anthropic Claude — propose an answer grounded in the State Anchor."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    response = client.messages.create(
+        model=os.environ.get("PROPOSER_MODEL", "claude-sonnet-4-6"),
+        max_tokens=2048,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_question}],
     )
+    return {"answer": response.content[0].text}
 
 
 def call_critic(proposer_answer: str, anchor_context: str) -> dict:
-    """Replace with a DIFFERENT model family for cognitive independence."""
-    raise NotImplementedError(
-        "Replace call_critic() with your critic LLM SDK. "
-        "Return: {'risk': 'low|medium|high', 'notes': str, 'unverified_claims': list[str]}"
+    """Google Gemini — verify the proposer's claims against the anchor.
+    Different model family = cognitive independence."""
+    from google import genai
+    from google.genai import types as genai_types
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    prompt = (
+        f"## Proposer answer\n\n{proposer_answer}\n\n"
+        f"## State Anchor (for verification)\n\n{anchor_context[:5000]}"
     )
+    response = client.models.generate_content(
+        model=os.environ.get("CRITIC_MODEL", "gemini-2.5-flash"),
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=(
+                "You are a rigorous auditor. Verify every material claim in the "
+                "proposer's answer against the provided State Anchor. Flag claims "
+                "you cannot corroborate. Assess overall risk: low / medium / high. "
+                "If the proposer treats a [PROVISIONAL] or [UNKNOWN] item as settled "
+                "fact without flagging it, that is automatic medium-or-higher risk. "
+                "Respond with JSON only — no markdown fences:\n"
+                '{"risk": "low|medium|high", "notes": "...", "unverified_claims": [...]}'
+            ),
+            max_output_tokens=1024,
+        ),
+    )
+    try:
+        text = response.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(text)
+    except Exception:
+        return {
+            "risk": "skipped",
+            "notes": f"critic parse error — raw: {response.text[:300]}",
+            "unverified_claims": [],
+        }
 
 
 def call_self_check(proposer_model_fn, proposed_diff: str, anchor_text: str) -> str:
-    """Re-prompt the proposer to confirm its ruling with a clean anchor read."""
-    raise NotImplementedError(
-        "Replace call_self_check() with a re-prompt to your proposer model. "
-        "Return: one-sentence string ('yes because X' or 'no because Y')"
+    """Re-prompt Claude to confirm the proposed ruling is consistent with the anchor."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    response = client.messages.create(
+        model=os.environ.get("PROPOSER_MODEL", "claude-sonnet-4-6"),
+        max_tokens=256,
+        system=(
+            "You are verifying whether a proposed ruling is consistent with the "
+            "existing State Anchor. Reply with exactly one sentence starting with "
+            "'yes because' or 'no because'."
+        ),
+        messages=[{"role": "user", "content": (
+            f"Proposed ruling:\n{proposed_diff}\n\n"
+            f"State Anchor (excerpt):\n{anchor_text[:3000]}\n\n"
+            "Is this ruling consistent with the anchor?"
+        )}],
     )
+    return response.content[0].text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +167,7 @@ def detect_ruling(proposer_answer: str) -> tuple[bool, str | None, list[str]]:
     clean_answer = "\n".join(
         line for line in lines
         if not any(line.startswith(k) for k in ("RULING_IMPLIED:", "SUPERSEDES:", "SCOPE:"))
+        and line.strip() != "```"   # strip orphaned fences when model wraps the block
     ).rstrip()
 
     return implied, clean_answer, scope, supersedes
@@ -153,10 +208,10 @@ def stage_provisional(
     ready = supersede_result["valid"]
 
     council_audit = {
-        "self_check": "STUB — replace call_self_check() to get real self-check",
+        "self_check": call_self_check(None, proposed_diff, anchor_text),
         "consistency_check": consistency,
         "supersede_check": supersede_result["message"],
-        "critic_cross_read": "not run — replace with call_critic() for high-stakes rulings",
+        "critic_cross_read": call_critic(proposed_diff, anchor_text),
     }
 
     prov_content = (
@@ -210,12 +265,12 @@ def _check_supersedes(supersedes_ids: list[str], anchor_text: str) -> dict:
 # Main turn handler
 # ---------------------------------------------------------------------------
 
-def run_turn(question: str, history: list[dict] | None = None) -> dict:
+def run_turn(question: str, history: list[dict] | None = None, anchor_path: Path | None = None) -> dict:
     """Execute one full turn through the council_precedent_review skill."""
     history = history or []
 
     # Load context
-    anchor_text = load_anchor(ANCHOR_PATH)
+    anchor_text = load_anchor(anchor_path or ANCHOR_PATH)
     skill_text = load_skill("council_precedent_review")
 
     # Assemble system prompt
@@ -310,10 +365,8 @@ def main():
         parser.print_help()
         return
 
-    global ANCHOR_PATH
-    ANCHOR_PATH = Path(args.anchor)
-
-    result = run_turn(args.question)
+    anchor_path = Path(args.anchor)
+    result = run_turn(args.question, anchor_path=anchor_path)
     print(json.dumps(result, indent=2, default=str))
 
 
